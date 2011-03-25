@@ -6,6 +6,8 @@ use overload '""' => sub { shift->to_xml }, fallback => 1;
 use Mojo::Util qw/decode encode html_unescape xml_escape/;
 use Scalar::Util 'weaken';
 
+use Mojo::JSON;
+
 # "How are the kids supposed to get home?
 #  I dunno. Internet?"
 has 'charset';
@@ -378,6 +380,193 @@ sub to_xml {
 
   return $result;
 }
+
+sub to_json {
+  my $self = shift;
+
+  my $json = new Mojo::JSON;
+
+  # Render
+  my $result = $self->_render_json($self->tree, $json, 0);
+
+  # Encode
+  #my $charset = $self->charset;
+  #encode $charset, $result if $charset;
+
+  return $result;
+}
+
+sub _render_json {
+  my ($self, $tree, $json, $level) = @_;
+
+  # Element
+  my $e = $tree->[0];
+
+  # Text
+  return $tree->[1]
+    if ($e eq 'text' || $e eq 'raw' || $e eq 'doctype'
+        || $e eq 'comment' || $e eq 'cdata' || $e eq 'pi');
+
+  # Offset
+  my $start = $e eq 'root' ? 1 : 2;
+
+  # Content
+  my $content = '';
+
+  $content .= '{'
+    if $e eq 'root';
+
+  # Start tag
+  my $attrs;
+  if ($e eq 'tag') {
+
+    # Offset
+    $start = 4;
+
+    # special case
+    $content .= '{ "'.$tree->[1].'": [ '
+      if ($level == 0);
+
+    # Open tag
+    $content .= '{ ';
+
+    # Attributes
+    my @attrs;
+    for my $key (sort keys %{$tree->[2]}) {
+      my $value = $tree->[2]->{$key};
+
+      # No value
+      push @attrs, '"'.$key.'": true ' and next unless $value;
+
+      # Escape
+      $value = $json->encode ( $value );
+
+      # Key and value
+      push @attrs, qq/"$key": $value/;
+    }
+    $attrs = join ', ', @attrs;
+    $content .= ' "_attributes": { '.$attrs.'} ' if $attrs;
+
+    # Empty tag
+    return "$content }" unless $tree->[4];
+  }
+
+  # Walk tree
+  my $groups = {
+        'tags' => {},
+        'text' => '',
+        'doctype' => '',
+        'pis' => [],
+        'comments' => [],
+        'cdata' => []
+        };
+  my $tag;
+  for my $i ($start .. $#$tree) {
+
+    # group tags, comments, text (not empty), pi an doctype
+
+    if ($tree->[$i]->[0] eq 'tag')
+      {
+        $tag = $tree->[$i]->[1];
+        $groups->{'tags'}->{ $tag } = []
+          unless (exists $groups->{'tags'}->{ $tag });
+
+        push @{ $groups->{'tags'}->{ $tag } },
+                $self->_render_json($tree->[$i], $json, $level+1);
+      }
+    elsif ($tree->[$i]->[0] eq 'text' && $tree->[$i]->[1] !~ m/^[\n\t\r\s]*$/m)
+      {
+        $groups->{'text'} .= $self->_render_json($tree->[$i], $json, $level+1);
+      }
+    elsif ($tree->[$i]->[0] eq 'doctype' && $tree->[$i]->[1] !~ m/^[\n\t\r\s]*$/m)
+      {
+        $groups->{'doctype'} .= $self->_render_json($tree->[$i], $json, $level+1);
+      }
+    elsif ($tree->[$i]->[0] eq 'pi')
+      {
+        push @{$groups->{'pis'}}, $self->_render_json($tree->[$i], $json, $level+1);
+      }
+    elsif ($tree->[$i]->[0] eq 'comment')
+      {
+        push @{$groups->{'comments'}}, $self->_render_json($tree->[$i], $json, $level+1);
+      }
+    elsif ($tree->[$i]->[0] eq 'cdata')
+      {
+        push @{$groups->{'cdata'}}, $self->_render_json($tree->[$i], $json, $level+1);
+      }
+    elsif ($tree->[$i]->[1] !~ m/^[\n\t\r\s]*$/m)
+      {
+        $groups->{'text'} .= $self->_render_json($tree->[$i], $json, $level+1);
+      }
+  }
+
+  if (scalar( keys %{ $groups->{'tags'} } ) > 0)
+    {
+      $content .= ", "
+        if ($attrs);
+
+      $content .= join(", ", map {
+        $tag = $_;
+        ' "'.$tag.'" : [ '.join (", ", @{ $groups->{'tags'}->{$tag} }). " ]";
+
+        } sort keys %{ $groups->{'tags'} });
+    }
+
+  if ($groups->{'text'} ne '')
+    {
+      $content .= ", "
+        if($attrs || scalar(keys %{ $groups->{'tags'} }) > 0);
+
+      $content .= '"_text": '. $json->encode ($groups->{'text'});
+    }
+
+  if ($groups->{'doctype'} ne '')
+    {
+      $content .= ", "
+        if($attrs || scalar(keys %{ $groups->{'tags'} }) > 0 || $groups->{'text'} ne '');
+
+      $content .= '"_doctype": '. $json->encode ($groups->{'doctype'});
+    }
+
+  if (scalar(@{$groups->{'pis'}}) > 0)
+    {
+      $content .= ", "
+        if($attrs || scalar(keys %{ $groups->{'tags'} }) > 0 || $groups->{'text'} ne ''
+           || $groups->{'doctype'} ne '');
+
+      $content .= '"_pis": [ '. join(", ", map { $json->encode ($_) } @{$groups->{'pis'}} ) . ' ]';
+    }
+
+  if (scalar(@{$groups->{'comments'}}) > 0)
+    {
+      $content .= ", "
+        if($attrs || scalar(keys %{ $groups->{'tags'} }) > 0 || $groups->{'text'} ne ''
+           || $groups->{'doctype'} ne '' || scalar(@{$groups->{'pis'}}) > 0);
+
+      $content .= '"_comments": [ '. join(", ", map { $json->encode ($_) } @{$groups->{'comments'}} ) . ' ]';
+    }
+
+  if (scalar(@{$groups->{'cdata'}}) > 0)
+    {
+      $content .= ", "
+        if($attrs || scalar(keys %{ $groups->{'tags'} }) > 0 || $groups->{'text'} ne ''
+           || $groups->{'doctype'} ne '' || scalar(@{$groups->{'pis'}}) > 0 || scalar(@{$groups->{'comments'}}) > 0);
+
+      $content .= '"_cdata": [ '. join(", ", map { $json->encode ($_) } @{$groups->{'cdata'}} ) . ' ]';
+    }
+
+  # End tag
+  $content .= ' }'
+    if ($e eq 'tag');
+
+  $content .= '] }'
+    if ($level == 0 && $e ne 'root');
+
+  $content .= '}'
+    if $e eq 'root';
+
+  return $content;
+}  
 
 sub type {
   my ($self, $type) = @_;
